@@ -1,0 +1,5 @@
+agno==2.5.14
+python-dotenv==1.2.2
+Requests==2.33.1
+torch==2.11.0
+transformers==5.5.0

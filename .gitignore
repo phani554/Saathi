@@ -20,6 +20,7 @@ lib-cov
 
 # Coverage directory used by tools like istanbul
 coverage
+
 *.lcov
 
 # nyc test coverage
@@ -39,6 +40,7 @@ build/Release
 
 # Dependency directories
 node_modules/
+models/
 jspm_packages/
 
 # Snowpack dependency directory (https://snowpack.dev/)
@@ -137,3 +139,69 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# =========================================
+# Python / Agno Agent Rules
+# =========================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+lfm-env/
+venv/
+env/
+# Agno / Database (If you add memory/storage later)
+*.db
+*.sqlite3
+
+# Agent Audio outputs (If you start saving TTS/STT files locally)
+agent/audio/*.wav
+agent/audio/*.mp3
+
+# =========================================
+# MetroMind WhatsApp Bridge Specific
+# =========================================
+
+# NEVER commit the WhatsApp authentication credentials to GitHub!
+whatsapp-bridge/auth/
+
+__pycache__/
+*.pyc
+
+# --- Python Specific ---
+lfm-env/
+__pycache__/
+*.pyc
+
+# --- Large AI Models (Crucial) ---
+# Your LFM2.5 model folder is ~2.5GB-5GB. Git will crash if you try to push this.
+lfm/models/
+
+# --- Node.js (WhatsApp Bridge) ---
+# Never upload node_modules; they are regenerated via 'npm install'
+whatsapp_bridge/node_modules/
+whatsapp_bridge/.npm
+whatsapp_bridge/package-lock.json
+
+# --- Sensitive Data & Local State ---
+.env
+contacts.vcf
+nicknames.json
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
+
+auth/
+/auth 
+
+/models/
+/models
+/models
