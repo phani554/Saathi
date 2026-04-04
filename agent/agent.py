@@ -131,7 +131,6 @@ AVAILABLE_TOOLS = {
 def run_gemini_agent():
     from agno.agent import Agent
     from agno.models.google import Gemini
-    from agno.memory import Memory
 
     print("[system] Booting Primary Cloud Agent (Gemini 3.1 Flash-Lite)...")
     
@@ -139,7 +138,6 @@ def run_gemini_agent():
         name="Saathi",
         model=Gemini(id="gemini-3.1-flash-lite-preview"), 
         tools=[get_contact_number, get_group_id, send_whatsapp_message, manage_whatsapp_session, save_nickname],
-        memory=Memory(), # Added RAM Memory for Multi-turn conversations
         instructions="""
         You are 'Saathi', a warm, patient, and reliable daily lifestyle assistant designed for seniors. 
         Tone: Friendly, respectful, clear, and concise.
