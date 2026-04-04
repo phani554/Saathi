@@ -1,342 +1,706 @@
 #!/usr/bin/env python3
-import os
-import sys
-import platform
-import requests
-import torch
-import re
+"""
+Saathi — Voice-First WhatsApp Companion
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRIMARY   : Gemini 3.1 Flash-Lite via agno.models.google.Gemini
+FALLBACK  : LFM2.5-1.2B Q4_K_M via agno.models.llama_cpp.LlamaCpp
+            → llama-server (OpenAI-compat REST, port LLAMA_PORT)
+            → Agno handles tool calling, memory, session — identical
+              to the cloud path, not a degraded custom loop
+
+SHARED    : BOTH agents share the same SQLite file (saathi.db) for:
+            • SqliteMemoryDb   — persists extracted user facts
+            • SqliteAgentStorage — persists session history
+            Memories learned in cloud mode survive a local fallback
+            and vice versa.
+
+VOICE     : Sarvam Saaras v3 STT (codemix → Hinglish-native)
+            Sarvam Bulbul  v3 TTS
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHY agno.models.llama_cpp.LlamaCpp instead of raw OpenAI client?
+
+  LlamaCpp is Agno's first-class subclass of OpenAILike. It means:
+  • Agno's full memory stack (Memory v2 + SqliteMemoryDb) works
+  • Agno's SqliteAgentStorage works — sessions persist across reboots
+  • Agno registers Python functions as tools natively — no manual
+    schema writing, no manual tool_calls parsing
+  • Both paths use identical Agent(...) construction — one code path
+  • llama-server+--jinja exposes LFM2.5's native chat template, so
+    <|tool_call_start|> tokens are handled by the server, not us
+
+WHY --jinja on llama-server?
+  Without --jinja the server uses a generic template and LFM2.5's
+  native Pythonic function-call tokens are not injected, which
+  degrades tool-call reliability. --jinja makes llama-server render
+  the model's own Jinja chat template — the same one Liquid AI
+  trained the model with.
+
+WHY Q4_K_M GGUF?
+  • ~750 MB RAM vs ~2.4 GB for BF16 PyTorch
+  • llama.cpp CPU decode: 113–239 tok/s vs ~15 tok/s via torch
+  • Zero torch/transformers in fallback path — cold start is instant
+"""
+
+import base64
+import gc
+import io
 import json
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import requests
 from dotenv import load_dotenv
 
-# Automatically load the .env file for API keys
 load_dotenv()
 
-# ─── CONFIGURATION ────────────────────────────────────────────────────────────
-const_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_ID = "LiquidAI/LFM2.5-1.2B-Instruct"
-BRIDGE_URL = "http://localhost:3000"
-VCARD_PATH = os.path.join(const_DIR, "contacts.vcf")
-NICKNAMES_PATH = os.path.join(const_DIR, "nicknames.json") # Persistent memory for aliases
+# ─── PATHS ─────────────────────────────────────────────────────────────────────
+AGENT_DIR      = Path(__file__).parent.resolve()
+VCARD_PATH     = AGENT_DIR / "contacts.vcf"
+NICKNAMES_PATH = AGENT_DIR / "nicknames.json"
+MEMORY_DB      = str(AGENT_DIR / "saathi.db")   # SHARED by both agents
+GGUF_DIR       = AGENT_DIR / "models"
+GGUF_FILE      = GGUF_DIR / "lfm2.5-1.2b-instruct-q4_k_m.gguf"
 
-# ─── NICKNAME SYSTEM ──────────────────────────────────────────────────────────
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+BRIDGE_URL   = os.getenv("BRIDGE_URL", "http://localhost:3000")
+LLAMA_PORT   = int(os.getenv("LLAMA_PORT", "8082"))
+LLAMA_CTX    = int(os.getenv("LLAMA_CTX", "8192"))
+GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+LFM_HF_REPO  = "LiquidAI/LFM2.5-1.2B-Instruct-GGUF"
+LFM_HF_FILE  = "lfm2.5-1.2b-instruct-q4_k_m.gguf"
+
+# ─── SARVAM VOICE ─────────────────────────────────────────────────────────────
+SARVAM_KEY      = os.getenv("SARVAM_API_KEY", "")
+SARVAM_STT_MODE = os.getenv("SARVAM_STT_MODE", "codemix")  # codemix = Hinglish
+SARVAM_STT_URL  = "https://api.sarvam.ai/speech-to-text"
+SARVAM_TTS_URL  = "https://api.sarvam.ai/text-to-speech"
+VOICE_READY     = bool(SARVAM_KEY)
+SAMPLE_RATE     = 16000
+RECORD_SECS     = int(os.getenv("RECORD_SECS", "7"))
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  VOICE LAYER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def record_audio(duration: int = RECORD_SECS) -> Optional[str]:
+    try:
+        import sounddevice as sd
+        from scipy.io import wavfile
+        print(f"🎤  Recording {duration}s … speak now")
+        frames = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE,
+                        channels=1, dtype=np.int16)
+        sd.wait()
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=AGENT_DIR)
+        wavfile.write(tmp.name, SAMPLE_RATE, frames)
+        tmp.close()
+        return tmp.name
+    except Exception as exc:
+        print(f"⚠️  Record failed: {exc}")
+        return None
+
+
+def sarvam_stt(audio_path: str) -> Optional[str]:
+    """Sarvam Saaras v3 — codemix mode handles Hinglish/mixed-language natively."""
+    if not SARVAM_KEY:
+        return None
+    try:
+        with open(audio_path, "rb") as fh:
+            resp = requests.post(
+                SARVAM_STT_URL,
+                headers={"api-subscription-key": SARVAM_KEY},
+                files={"file": ("audio.wav", fh, "audio/wav")},
+                data={"model": "saaras:v3", "mode": SARVAM_STT_MODE},
+                timeout=30,
+            )
+        resp.raise_for_status()
+        body = resp.json()
+        transcript = (body.get("transcript") or "").strip()
+        lang = body.get("language_code", "?")
+        if transcript:
+            print(f"📝  [{lang}/{SARVAM_STT_MODE}] {transcript}")
+        return transcript or None
+    except Exception as exc:
+        print(f"⚠️  STT error: {exc}")
+        return None
+    finally:
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+
+
+def _detect_lang(text: str) -> str:
+    for ch in text:
+        cp = ord(ch)
+        if 0x0900 <= cp <= 0x097F: return "hi-IN"
+        if 0x0C00 <= cp <= 0x0C7F: return "te-IN"
+        if 0x0B80 <= cp <= 0x0BFF: return "ta-IN"
+        if 0x0980 <= cp <= 0x09FF: return "bn-IN"
+        if 0x0A80 <= cp <= 0x0AFF: return "gu-IN"
+        if 0x0C80 <= cp <= 0x0CFF: return "kn-IN"
+        if 0x0D00 <= cp <= 0x0D7F: return "ml-IN"
+        if 0x0A00 <= cp <= 0x0A7F: return "pa-IN"
+    return "en-IN"
+
+
+def sarvam_tts(text: str) -> Optional[bytes]:
+    """Sarvam Bulbul v3 — auto-detects language from Unicode script."""
+    if not SARVAM_KEY or not text.strip():
+        return None
+    lang = _detect_lang(text)
+    try:
+        resp = requests.post(
+            SARVAM_TTS_URL,
+            headers={"api-subscription-key": SARVAM_KEY, "Content-Type": "application/json"},
+            json={
+                "inputs": [text[:2500]],
+                "target_language_code": lang,
+                "model": "bulbul:v3",
+                "speaker": "meera",
+                "pace": 0.85,
+                "enable_preprocessing": True,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        audios = resp.json().get("audios", [])
+        return base64.b64decode(audios[0]) if audios else None
+    except Exception as exc:
+        print(f"⚠️  TTS error: {exc}")
+        return None
+
+
+def play_audio(wav_bytes: bytes) -> None:
+    if not wav_bytes:
+        return
+    try:
+        import sounddevice as sd
+        from scipy.io import wavfile
+        rate, data = wavfile.read(io.BytesIO(wav_bytes))
+        if data.ndim > 1:
+            data = data[:, 0]
+        sd.play(data.astype(np.float32) / 32768.0, rate)
+        sd.wait()
+    except Exception as exc:
+        print(f"⚠️  Playback failed: {exc}")
+
+
+def speak(text: str) -> None:
+    if VOICE_READY:
+        play_audio(sarvam_tts(text))
+
+
+def voice_input() -> Optional[str]:
+    path = record_audio()
+    return sarvam_stt(path) if path else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  TOOL IMPLEMENTATIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
 def load_nicknames() -> dict:
-    if os.path.exists(NICKNAMES_PATH):
-        with open(NICKNAMES_PATH, "r") as f:
-            return json.load(f)
+    if NICKNAMES_PATH.exists():
+        return json.loads(NICKNAMES_PATH.read_text(encoding="utf-8"))
     return {}
 
+
 def save_nickname(nickname: str, real_name: str) -> str:
-    """Saves a nickname mapping so the agent remembers it permanently."""
+    """Permanently save a nickname → real contact name mapping."""
     nicks = load_nicknames()
     nicks[nickname.lower()] = real_name
-    with open(NICKNAMES_PATH, "w") as f:
-        json.dump(nicks, f)
-    return f"Success: Whenever the user says '{nickname}', I will now search for '{real_name}'."
+    NICKNAMES_PATH.write_text(
+        json.dumps(nicks, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return f"Saved: '{nickname}' → '{real_name}'."
 
-# ─── SHARED PYTHON TOOLS ──────────────────────────────────────────────────────
+
 def get_contact_number(name: str) -> str:
-    """Reads contacts.vcf, handles duplicate names, resolves nicknames, and filters landlines."""
+    """
+    Look up a WhatsApp phone number from contacts.vcf by name.
+    Resolves nicknames first. Filters landlines. Handles duplicates.
+    """
     try:
-        # 1. Resolve Nickname first
         nicks = load_nicknames()
         search_name = nicks.get(name.lower(), name)
-
-        if not os.path.exists(VCARD_PATH): return "Error: contacts.vcf not found."
-        
-        with open(VCARD_PATH, 'r', encoding='utf-8', errors='ignore') as f:
-            vcard_data = f.read()
-            
-        vcards = vcard_data.split("BEGIN:VCARD")
-        matches = {}
-        
-        for card in vcards:
-            if not card.strip(): continue
-            
-            fn_match = re.search(r'^FN:(.+)$', card, re.MULTILINE)
-            if not fn_match: continue
-            
-            full_name = fn_match.group(1).strip()
-            
-            if search_name.lower() in full_name.lower():
-                tel_matches = re.findall(r'^TEL.*?:(.+)$', card, re.MULTILINE)
-                mobile_number = None
-                
-                for raw_number in tel_matches:
-                    clean_number = re.sub(r'[^\d+]', '', raw_number)
-                    
-                    if clean_number.startswith("0") or clean_number.startswith("+910"):
-                        continue
-                    
-                    digits_only = re.sub(r'\D', '', clean_number)
-                    if len(digits_only) >= 10:
-                        mobile_number = clean_number
-                        break 
-                
-                if mobile_number:
-                    matches[full_name] = mobile_number
-                    
-        if len(matches) == 0:
-            if search_name != name:
-                return f"Error: Contact '{search_name}' (mapped from nickname '{name}') not found."
-            return f"Error: Contact '{name}' not found."
-        elif len(matches) == 1:
+        if not VCARD_PATH.exists():
+            return "Error: contacts.vcf not found. Place it in the agent/ folder."
+        raw = VCARD_PATH.read_text(encoding="utf-8", errors="ignore")
+        matches: dict[str, str] = {}
+        for card in raw.split("BEGIN:VCARD"):
+            if not card.strip():
+                continue
+            fn = re.search(r"^FN:(.+)$", card, re.MULTILINE)
+            if not fn:
+                continue
+            full_name = fn.group(1).strip()
+            if search_name.lower() not in full_name.lower():
+                continue
+            for raw_tel in re.findall(r"^TEL.*?:(.+)$", card, re.MULTILINE):
+                clean = re.sub(r"[^\d+]", "", raw_tel)
+                digits = re.sub(r"\D", "", clean)
+                if clean.startswith("0") or clean.startswith("+910"):
+                    continue
+                if len(digits) >= 10:
+                    matches[full_name] = clean
+                    break
+        if not matches:
+            suffix = f" (alias for '{name}')" if search_name != name else ""
+            return f"Contact '{search_name}'{suffix} not found in contacts."
+        if len(matches) == 1:
             return list(matches.values())[0]
-        else:
-            names_found = ", ".join(matches.keys())
-            return f"Clarification Needed: I found multiple contacts for '{search_name}': {names_found}. Ask the user which one they meant."
-            
-    except Exception as e: 
-        return f"Error: {str(e)}"
+        names = ", ".join(matches.keys())
+        return f"Multiple contacts found for '{search_name}': {names}. Ask the user which one."
+    except Exception as exc:
+        return f"Error reading contacts: {exc}"
+
 
 def get_group_id(group_name: str) -> str:
+    """Find a WhatsApp group JID by partial group name."""
     try:
-        res = requests.get(f"{BRIDGE_URL}/groups")
-        if res.status_code == 200:
+        res = requests.get(f"{BRIDGE_URL}/groups", timeout=5)
+        if res.ok:
             for g in res.json().get("groups", []):
-                if group_name.lower() in g["name"].lower(): return f"{g['id']}"
-        return "Group not found."
-    except: return "Error fetching groups from bridge."
+                if group_name.lower() in g["name"].lower():
+                    return g["id"]
+        return f"Group '{group_name}' not found."
+    except Exception:
+        return "Error: WhatsApp bridge unreachable."
+
 
 def send_whatsapp_message(identifier: str, message: str) -> str:
+    """
+    Send a WhatsApp message. ONLY call this after the user has explicitly
+    confirmed ('yes', 'send it', 'haan', etc.). Never call preemptively.
+    """
     try:
-        res = requests.post(f"{BRIDGE_URL}/send", json={"phone": identifier, "message": message})
-        if res.status_code == 200: return "Message sent successfully."
-        return f"Failed to send: {res.text}"
-    except: return "Bridge connection error."
+        res = requests.post(
+            f"{BRIDGE_URL}/send",
+            json={"phone": identifier, "message": message},
+            timeout=10,
+        )
+        return "Message sent successfully." if res.ok else f"Failed: {res.text}"
+    except Exception:
+        return "Error: WhatsApp bridge unreachable."
+
 
 def manage_whatsapp_session(action: str) -> str:
+    """Control the WhatsApp bridge session. Actions: start | logout | get_qr"""
     try:
         if action == "logout":
-            requests.post(f"{BRIDGE_URL}/auth/logout")
+            requests.post(f"{BRIDGE_URL}/auth/logout", timeout=5)
             return "Logged out successfully."
-        elif action == "start":
-            requests.post(f"{BRIDGE_URL}/start")
-            return "Booting new session. Fetch QR in 3 seconds."
-        elif action == "get_qr":
-            res = requests.get(f"{BRIDGE_URL}/auth/qr")
-            return res.json().get('qr') if res.status_code == 200 else "QR not ready."
-        return "Invalid action provided."
-    except: return "Bridge connection error."
-
-AVAILABLE_TOOLS = {
-    "get_contact_number": get_contact_number,
-    "get_group_id": get_group_id,
-    "send_whatsapp_message": send_whatsapp_message,
-    "manage_whatsapp_session": manage_whatsapp_session,
-    "save_nickname": save_nickname
-}
-
-# ─── AGNO GEMINI (PRIMARY CLOUD AGENT) ────────────────────────────────────────
-def run_gemini_agent():
-    from agno.agent import Agent
-    from agno.models.google import Gemini
-    from agno.memory import Memory
-
-    print("[system] Booting Primary Cloud Agent (Gemini 3.1 Flash-Lite)...")
-    
-    agent = Agent(
-        name="Saathi",
-        model=Gemini(id="gemini-3.1-flash-lite-preview"), 
-        tools=[get_contact_number, get_group_id, send_whatsapp_message, manage_whatsapp_session, save_nickname],
-        memory=Memory(), # Added RAM Memory for Multi-turn conversations
-        instructions="""
-        You are 'Saathi', a warm, patient, and reliable daily lifestyle assistant designed for seniors. 
-        Tone: Friendly, respectful, clear, and concise.
-
-        LANGUAGE & MEMORY RULES:
-        1. MULTILINGUAL: You natively understand over 50 languages. Always reply in the user's language.
-        2. CONTEXT: You have conversational memory. Remember previous turns and confirmations.
-        
-        NICKNAME RULE (CRITICAL):
-        If a user asks to message someone using a nickname or relationship (e.g., "my boss", "mom", "doctor") and the `get_contact_number` tool fails to find them, ask the user for their real saved name. 
-        ONCE THE USER TELLS YOU THE REAL NAME, you MUST immediately use the `save_nickname` tool to permanently map it (e.g., ARG1="boss", ARG2="Rahul Sharma") before proceeding.
-
-        SOP - SENDING MESSAGES (STRICT COMPLIANCE REQUIRED):
-        Step 1: GATHER. Find exact message and recipient. 
-        Step 2: LOOKUP. Use 'get_contact_number' or 'get_group_id'.
-        Step 3: DRAFT. Tell the user the draft message. YOU MUST EXPLICITLY ASK: "Should I send this?"
-        Step 4: EXECUTE. ONLY AFTER the user confirms with a "yes", execute 'send_whatsapp_message'.
-        Step 5: CONFIRM. Say "Message sent successfully."
-        """
-    )
-
-    print("\n[Saathi-Cloud] Ready! Type 'exit' to stop.\n")
-    while True:
-        try:
-            user_input = input("You: ")
-            if user_input.lower() in ["exit", "quit"]: break
-            agent.print_response(user_input, stream=True)
-            print("\n")
-        except KeyboardInterrupt: break
-
-
-# ─── LOCAL LFM FALLBACK (BARE-METAL) ──────────────────────────────────────────
-def tune_cpu():
-    cores = os.cpu_count() or 4
-    torch.set_num_threads(max(1, min(4, cores // 2)))
-    try: torch.set_num_interop_threads(1)
-    except: pass
-
-def load_tokenizer_model(local_only: bool):
-    tok = AutoTokenizer.from_pretrained(MODEL_ID, local_files_only=local_only)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, device_map="cpu", dtype=torch.float32,
-        local_files_only=local_only, low_cpu_mem_usage=True
-    )
-    model.eval()
-    return tok, model
-
-def parse_tool_command(response: str):
-    match = re.search(r'\[TOOL:\s*(\w+),\s*ARG1:\s*(.*?)(?:,\s*ARG2:\s*(.*?))?\]', response)
-    if match:
-        tool_name = match.group(1)
-        arg1 = match.group(2).strip('"\' ') if match.group(2) else None
-        arg2 = match.group(3).strip('"\' ') if match.group(3) else None
-        return tool_name, arg1, arg2
-    return None, None, None
-
-def run_local_fallback_agent():
-    print("[system] Network/API Error detected. Booting Local Fallback (Liquid 1.2B Instruct)...")
-    tune_cpu()
-
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_HUB_OFFLINE"] = "1"
-
-    try:
-        tok, model = load_tokenizer_model(local_only=True)
-        print("✅ Local Model loaded from cache.")
+        if action == "start":
+            requests.post(f"{BRIDGE_URL}/start", timeout=5)
+            return "Session starting — fetch QR in ~3 seconds."
+        if action == "get_qr":
+            res = requests.get(f"{BRIDGE_URL}/auth/qr", timeout=5)
+            return res.json().get("qr", "QR not ready.") if res.ok else "QR not ready."
+        return f"Unknown action '{action}'. Use: start | logout | get_qr"
     except Exception:
-        print("❌ Model not cached. Connect to internet once to download.")
-        return
+        return "Error: WhatsApp bridge unreachable."
 
-    print("\n[Saathi-Local] Ready! Type 'exit' to stop.\n")
 
-    system_prompt = """You are Saathi. You are currently operating in OFFLINE FALLBACK MODE.
-You MUST extract actual values from the user's prompt. NEVER use literal placeholders like 'contact_name'.
+def check_bridge_health() -> str:
+    """Check if the WhatsApp bridge is connected and ready to send messages."""
+    try:
+        data = requests.get(f"{BRIDGE_URL}/health", timeout=3).json()
+        if data.get("connected"):
+            return "Bridge is connected and ready."
+        if data.get("qrPending"):
+            return "Bridge needs QR scan. Call manage_whatsapp_session(action='get_qr')."
+        return "Bridge is starting up — retry in a moment."
+    except Exception:
+        return "Bridge unreachable — is the Node.js bridge running?"
 
-You MUST follow these exact steps when sending a message:
-STEP 1: Check if you know the exact phone number. If not, output exactly: [TOOL: get_contact_number, ARG1: Actual Name]
-STEP 2: Wait for the System Note to return the real digits.
-STEP 3: Draft the message and ask the user "Should I send this to [Name]?" 
-STEP 4: Wait for user to say yes.
-STEP 5: If yes, output exactly: [TOOL: send_whatsapp_message, ARG1: Digits from Step 2, ARG2: message]
 
-If the user teaches you a nickname, use: [TOOL: save_nickname, ARG1: nickname, ARG2: real_name]
+# All tools in one list — passed directly to Agent(tools=[...]) in both paths
+SAATHI_TOOLS = [
+    get_contact_number,
+    get_group_id,
+    send_whatsapp_message,
+    manage_whatsapp_session,
+    save_nickname,
+    check_bridge_health,
+]
 
-Available tools:
-[TOOL: get_contact_number, ARG1: name]
-[TOOL: get_group_id, ARG1: name]
-[TOOL: send_whatsapp_message, ARG1: id, ARG2: text]
-[TOOL: manage_whatsapp_session, ARG1: action]
-[TOOL: save_nickname, ARG1: nickname, ARG2: real_name]
+# ──────────────────────────────────────────────────────────────────────────────
+#  SHARED SYSTEM PROMPT
+# ──────────────────────────────────────────────────────────────────────────────
 
-Keep chat replies to 1 sentence. Do NOT skip steps."""
+SAATHI_SYSTEM = """\
+You are Saathi, a warm, patient WhatsApp assistant for seniors and people with \
+accessibility needs. Tone: friendly, clear, never use tech jargon.
 
-    conversation = [{"role": "system", "content": system_prompt}]
-    
-    # 1. TRANSPARENCY: Announce fallback mode explicitly to the user
-    fallback_greeting = "⚠️ *I am currently running in Offline Fallback Mode. My memory is shorter, but I can still securely read your contacts, learn nicknames, and send WhatsApp messages. How can I help you?*"
-    print(f"Saathi: {fallback_greeting}")
-    conversation.append({"role": "assistant", "content": fallback_greeting})
+LANGUAGE: Always reply in the user's language — Hinglish, Hindi, Telugu, \
+Tamil, English, etc.
 
-    # 2. MEMORY: Keep System Prompt + last 10 messages to prevent RAM crashes
-    MAX_HISTORY = 11 
+NICKNAME RULE:
+If the user says "message my boss / mom / doctor" and get_contact_number fails, \
+ask for their real saved name. Once told, IMMEDIATELY call save_nickname to \
+remember it permanently before doing anything else.
+
+MESSAGE SENDING SOP — follow ALL steps, never skip:
+  1. GATHER   — Confirm recipient AND exact message text.
+  2. LOOKUP   — Call get_contact_number (or get_group_id for groups).
+  3. DRAFT    — Read the draft back word-for-word. Ask: "Should I send this?"
+  4. WAIT     — Do NOT proceed until user says yes / haan / send it.
+  5. SEND     — Only now call send_whatsapp_message.
+  6. CONFIRM  — Say "Sent!" clearly.
+
+CRITICAL: Never call send_whatsapp_message without explicit confirmation.\
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SHARED AGNO MEMORY STACK  (identical for both cloud and local agents)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_memory_and_storage(model):
+    """
+    Build Memory + Storage backed by the shared saathi.db SQLite file.
+
+    Both the cloud Gemini agent and the local LFM2.5 agent call this with
+    their respective model instances. Since the DB path is the same, all
+    learned facts and session history are shared across both modes.
+
+    Memory (agno.memory.v2):
+      enable_agentic_memory=True  → the model extracts user facts at the end
+      of each run and stores them in SqliteMemoryDb. On the next run, Agno
+      injects those facts into the system context automatically.
+
+    Storage (SqliteAgentStorage):
+      add_history_to_messages=True + num_history_runs=N → the last N runs are
+      loaded from disk and prepended to the context each turn. This gives
+      true cross-session conversational continuity without re-prompting.
+
+    Note on 1.2B memory extraction:
+      LFM2.5 extracts simple facts ("name is Rahul", "prefers Hindi") very
+      reliably. Complex multi-hop reasoning during extraction is not expected.
+      The important point: if Gemini already extracted rich memories, they are
+      in the DB and LFM2.5 will READ them in context even without re-extracting.
+    """
+    from agno.memory.v2.memory import Memory
+    from agno.memory.v2.db.sqlite import SqliteMemoryDb
+    from agno.storage.agent.sqlite import SqliteAgentStorage
+
+    memory = Memory(
+        model=model,
+        db=SqliteMemoryDb(table_name="saathi_memory", db_file=MEMORY_DB),
+    )
+    storage = SqliteAgentStorage(
+        table_name="saathi_sessions",
+        db_file=MEMORY_DB,
+    )
+    return memory, storage
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SHARED CONVERSATION LOOP
+#  Both agents call this after building their Agent instance.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _conversation_loop(agent, mode_label: str) -> None:
+    voice_mode = VOICE_READY
+    _print_banner(voice_mode, mode_label)
+
+    if not VOICE_READY and "LFM" in mode_label:
+        print(
+            "ℹ️  Offline text mode: please type in English or romanised Hinglish.\n"
+            "   Hindi/Telugu script works best via voice mode (needs SARVAM_API_KEY).\n"
+        )
 
     while True:
         try:
-            user_input = input("You: ")
-            if user_input.lower() in ["exit", "quit"]: break
-            conversation.append({"role": "user", "content": user_input})
-            
-            # Slide window to prevent Context Overflow Memory Crashes
-            if len(conversation) > MAX_HISTORY:
-                conversation = [conversation[0]] + conversation[-(MAX_HISTORY-1):]
-            
-            enc = tok.apply_chat_template(conversation, add_generation_prompt=True, return_tensors="pt", return_dict=True)
-            with torch.inference_mode():
-                out = model.generate(
-                    input_ids=enc["input_ids"], attention_mask=enc.get("attention_mask", None),
-                    max_new_tokens=150, do_sample=False, eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id
-                )
-            response = tok.decode(out[0][enc["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
-            
-            print(f"Saathi: {response}")
-            conversation.append({"role": "assistant", "content": response})
+            user_input = _get_input(voice_mode)
+            if user_input is None:
+                continue
+            cmd = user_input.lower().strip()
+            if cmd in ("exit", "quit", "bye", "बाय"):
+                break
+            if cmd == "voice":
+                voice_mode = not voice_mode
+                print(f"  Voice: {'ON 🔊' if voice_mode else 'OFF ⌨️'}\n")
+                continue
 
-            if "[TOOL:" in response:
-                tool_name, arg1, arg2 = parse_tool_command(response)
-                
-                if tool_name and tool_name in AVAILABLE_TOOLS:
-                    print(f"\n⚙️ Executing {tool_name}...")
-                    try:
-                        if arg1 in ["contact_name", "phone_number", "id", "name"]:
-                            raise ValueError(f"Model hallucinaton detected. You passed the literal word '{arg1}' instead of the actual data.")
+            print("💭 …")
+            # stream=False → we get the full text, then pipe it to TTS
+            response = agent.run(user_input, stream=False)
+            text = (response.content or "").strip() or "(no response)"
+            print(f"\nSaathi: {text}\n")
+            if voice_mode:
+                speak(text)
 
-                        if arg2: result = AVAILABLE_TOOLS[tool_name](arg1, arg2)
-                        elif arg1: result = AVAILABLE_TOOLS[tool_name](arg1)
-                        else: result = AVAILABLE_TOOLS[tool_name]()
-                        
-                        print(f"⚙️ Result: {result}\n")
-                        
-                        conversation.append({"role": "user", "content": f"System Note: Tool returned -> {result}. Continue."})
-                        
-                        # Apply sliding window before tool follow-up
-                        if len(conversation) > MAX_HISTORY:
-                            conversation = [conversation[0]] + conversation[-(MAX_HISTORY-1):]
-                        
-                        enc = tok.apply_chat_template(conversation, add_generation_prompt=True, return_tensors="pt", return_dict=True)
-                        with torch.inference_mode():
-                            out = model.generate(
-                                input_ids=enc["input_ids"], attention_mask=enc.get("attention_mask", None),
-                                max_new_tokens=100, do_sample=False, eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id
-                            )
-                        follow_up = tok.decode(out[0][enc["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
-                        print(f"Saathi: {follow_up}")
-                        conversation.append({"role": "assistant", "content": follow_up})
-                        
-                    except Exception as e:
-                        error_msg = f"Tool execution failed: {e}. You MUST pass actual names or numbers, not placeholders."
-                        print(f"⚠️ {error_msg}")
-                        
-                        conversation.append({"role": "user", "content": f"System Note: {error_msg}"})
-                        
-                        # Apply sliding window before error retry
-                        if len(conversation) > MAX_HISTORY:
-                            conversation = [conversation[0]] + conversation[-(MAX_HISTORY-1):]
-                        
-                        enc = tok.apply_chat_template(conversation, add_generation_prompt=True, return_tensors="pt", return_dict=True)
-                        with torch.inference_mode():
-                            out = model.generate(
-                                input_ids=enc["input_ids"], attention_mask=enc.get("attention_mask", None),
-                                max_new_tokens=100, do_sample=False, eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id
-                            )
-                        follow_up = tok.decode(out[0][enc["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
-                        print(f"Saathi: {follow_up}")
-                        conversation.append({"role": "assistant", "content": follow_up})
-                else:
-                    print(f"⚠️ Could not parse tool or invalid tool requested.")
-                    
-        except KeyboardInterrupt: 
+        except KeyboardInterrupt:
             break
 
-# ─── ROUTER ───────────────────────────────────────────────────────────────────
-def main():
-    print("==================================================")
-    print(f" OS: {platform.system()} {platform.release()}")
-    print("==================================================\n")
+    print("\n[Saathi] Goodbye!\n")
 
-    api_key = os.getenv("GEMINI_API_KEY")
 
-    if api_key:
+# ──────────────────────────────────────────────────────────────────────────────
+#  CLOUD AGENT — Gemini 3.1 Flash-Lite
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_gemini_agent() -> None:
+    from agno.agent import Agent
+    from agno.models.google import Gemini
+
+    print(f"[Saathi] Booting cloud agent ({GEMINI_MODEL}) …")
+    model = Gemini(id=GEMINI_MODEL)
+    memory, storage = _build_memory_and_storage(model)
+
+    agent = Agent(
+        name="Saathi",
+        model=model,
+        tools=SAATHI_TOOLS,
+        memory=memory,
+        storage=storage,
+        enable_agentic_memory=True,      # extracts + stores facts per session
+        add_history_to_messages=True,    # loads last N runs from DB on each turn
+        num_history_runs=10,
+        description=SAATHI_SYSTEM,
+        markdown=False,                  # plain text plays better via TTS
+        show_tool_calls=False,
+    )
+    _conversation_loop(agent, GEMINI_MODEL)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  LOCAL AGENT — LFM2.5-1.2B via agno.models.llama_cpp.LlamaCpp
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _find_llama_server() -> Optional[str]:
+    import shutil
+    for name in ["llama-server"]:
+        p = shutil.which(name)
+        if p:
+            return p
+    for p in [
+        Path("/usr/local/bin/llama-server"),
+        Path("/opt/homebrew/bin/llama-server"),
+        Path.home() / "llama.cpp/build/bin/llama-server",
+        Path.home() / ".local/bin/llama-server",
+    ]:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _download_gguf() -> Optional[Path]:
+    if GGUF_FILE.exists():
+        print(f"✅  GGUF cached: {GGUF_FILE}")
+        return GGUF_FILE
+    print(f"📥  Downloading {LFM_HF_FILE} (~750 MB, first run only) …")
+    GGUF_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            [
+                sys.executable, "-m", "huggingface_hub", "download",
+                "--repo-type", "model",
+                LFM_HF_REPO, LFM_HF_FILE,
+                "--local-dir", str(GGUF_DIR),
+                "--local-dir-use-symlinks", "False",
+            ],
+            check=True,
+        )
+        if GGUF_FILE.exists():
+            print(f"✅  Downloaded: {GGUF_FILE}")
+            return GGUF_FILE
+    except subprocess.CalledProcessError as exc:
+        print(f"❌  Download failed: {exc}")
+    except FileNotFoundError:
+        print("❌  huggingface_hub missing. Run: pip install huggingface_hub")
+    return None
+
+
+def _start_llama_server(gguf_path: Path, llama_bin: str) -> Optional[subprocess.Popen]:
+    """
+    Start llama-server with flags tuned for Saathi's use-case:
+
+    --jinja     Use the model's own Jinja chat template.
+                CRITICAL for LFM2.5: this activates the native
+                <|tool_call_start|> / <|tool_call_end|> token handling
+                so function calls are formatted exactly as the model
+                was trained to produce them.
+
+    -np 1       One parallel slot — single user, saves RAM.
+
+    -t N        CPU threads (cores-1, max 8).
+
+    --no-mmap   Don't memory-map weights. More stable on RAM-constrained
+                edge devices; avoids page-fault latency spikes mid-sentence.
+
+    -ngl 0      No GPU layer offload. Set to 99 if a GPU is available —
+                llama.cpp will auto-detect and offload as many layers as fit.
+    """
+    cpu_count = os.cpu_count() or 4
+    threads   = max(2, min(cpu_count - 1, 8))
+
+    cmd = [
+        llama_bin,
+        "-m", str(gguf_path),
+        "-c", str(LLAMA_CTX),
+        "--port", str(LLAMA_PORT),
+        "--host", "127.0.0.1",
+        "-np", "1",
+        "-t", str(threads),
+        "--jinja",          # ← native LFM2.5 chat template (tool tokens!)
+        "--no-mmap",
+        "-ngl", "0",
+        "--log-disable",
+    ]
+    print(f"[llama-server] port={LLAMA_PORT}  threads={threads}  ctx={LLAMA_CTX}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    base = f"http://127.0.0.1:{LLAMA_PORT}"
+    for _ in range(30):        # up to 15 s
+        time.sleep(0.5)
+        try:
+            if requests.get(f"{base}/health", timeout=1).ok:
+                print(f"✅  llama-server ready at {base}")
+                return proc
+        except requests.ConnectionError:
+            pass
+
+    print("❌  llama-server failed to start in 15 s")
+    proc.terminate()
+    return None
+
+
+def run_local_fallback_agent() -> None:
+    llama_bin = _find_llama_server()
+    if not llama_bin:
+        print(
+            "❌  llama-server not found.\n"
+            "    macOS  :  brew install llama.cpp\n"
+            "    Linux  :  download from github.com/ggml-org/llama.cpp/releases\n"
+            "    Build  :  git clone … && cmake -B build && cmake --build build -j\n"
+        )
+        return
+
+    gguf_path = _download_gguf()
+    if not gguf_path:
+        return
+
+    server_proc = _start_llama_server(gguf_path, llama_bin)
+    if not server_proc:
+        return
+
+    try:
+        from agno.agent import Agent
+        from agno.models.llama_cpp import LlamaCpp
+    except ImportError as exc:
+        print(f"❌  agno not installed: {exc}")
+        server_proc.terminate()
+        return
+
+    print("[Saathi] Building local LFM2.5 agent (Agno + LlamaCpp) …")
+
+    # LlamaCpp is Agno's OpenAILike subclass pointing at llama-server.
+    # All of Agno's memory, storage, and tool-calling machinery works
+    # identically to the cloud path.
+    model = LlamaCpp(
+        id=LFM_HF_FILE,
+        base_url=f"http://127.0.0.1:{LLAMA_PORT}/v1",
+        api_key="not-needed",
+        temperature=0.1,          # LFM2.5 recommended params
+        top_p=0.1,
+        top_k=50,
+        frequency_penalty=0.05,   # ≈ repetition_penalty 1.05
+        max_tokens=512,
+    )
+    memory, storage = _build_memory_and_storage(model)
+
+    agent = Agent(
+        name="Saathi",
+        model=model,
+        tools=SAATHI_TOOLS,
+        memory=memory,
+        storage=storage,
+        enable_agentic_memory=True,   # LFM2.5 handles simple fact extraction well
+        add_history_to_messages=True,
+        num_history_runs=5,           # fewer than cloud to fit 8K context
+        description=SAATHI_SYSTEM,
+        markdown=False,
+        show_tool_calls=False,
+    )
+
+    label = f"LFM2.5-1.2B Q4_K_M · llama-server :{LLAMA_PORT}"
+    try:
+        _conversation_loop(agent, label)
+    finally:
+        print("\n[Saathi] Stopping llama-server …")
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  UI HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _print_banner(voice_mode: bool, mode_label: str) -> None:
+    print(f"\n{'='*58}")
+    print(f"  Saathi [{mode_label}]")
+    if voice_mode:
+        print(f"  🔊 Voice ON  (Sarvam {SARVAM_STT_MODE} STT + Bulbul TTS)")
+        print("  Press ENTER with no text to record your voice")
+    else:
+        print("  ⌨️  Text mode  (set SARVAM_API_KEY to enable voice)")
+    print("  Type 'voice' to toggle  |  'exit' to quit")
+    print(f"{'='*58}\n")
+
+
+def _get_input(voice_mode: bool) -> Optional[str]:
+    prompt = "🎤  ENTER=record / type: " if voice_mode else "You: "
+    try:
+        raw = input(prompt).strip()
+    except EOFError:
+        return "exit"
+    if voice_mode and raw == "":
+        transcript = voice_input()
+        if not transcript:
+            print("⚠️  Nothing captured — try again.\n")
+            return None
+        return transcript
+    return raw or None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ENTRY POINT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    import platform
+    print("=" * 58)
+    print("  Saathi — Voice-First WhatsApp Companion")
+    print(f"  OS    : {platform.system()} {platform.release()}")
+    print(f"  Voice : {'Sarvam ' + SARVAM_STT_MODE + ' + Bulbul ✅' if VOICE_READY else 'Disabled (set SARVAM_API_KEY)'}")
+    print(f"  DB    : {MEMORY_DB}")
+    print("=" * 58 + "\n")
+
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if gemini_key:
         try:
             run_gemini_agent()
-        except Exception as e:
-            print(f"⚠️ Gemini Agent failed to start: {e}")
+        except Exception as exc:
+            print(f"\n⚠️  Cloud agent failed: {exc}")
+            print("    Falling back to local LFM2.5 …\n")
             run_local_fallback_agent()
     else:
-        print("⚠️ No GEMINI_API_KEY found in environment variables.")
+        print("ℹ️  No GEMINI_API_KEY — starting local LFM2.5 fallback.\n")
         run_local_fallback_agent()
+
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,22 @@
-agno==2.5.14
-python-dotenv==1.2.2
-Requests==2.33.1
-torch==2.11.0
-transformers==5.5.0
+# Saathi — Python dependencies
+# pip install -r requirements.txt
+
+# ── Cloud agent ───────────────────────────────────────────────────────────────
+agno>=2.5.14
+sqlalchemy>=2.0.0           # agno SQLite memory/storage backend
+google-generativeai>=0.8.0  # Gemini SDK (used by agno.models.google)
+
+# ── Local fallback (llama-server path) ────────────────────────────────────────
+# torch / transformers NOT required — llama-server handles inference natively.
+# Only huggingface_hub is needed to download the GGUF file once.
+huggingface_hub>=0.23.0     # hf download CLI used to fetch the GGUF
+openai>=1.30.0              # OpenAI-compat client → llama-server REST API
+
+# ── Sarvam Voice (STT + TTS) ─────────────────────────────────────────────────
+sounddevice>=0.4.6           # mic recording + speaker playback
+scipy>=1.11.0                # wavfile read/write
+numpy>=1.24.0                # audio buffer ops
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+requests>=2.31.0
